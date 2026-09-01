@@ -14,13 +14,7 @@ import {
 import Gauge from './components/Gauge';
 import LiveCharts from './components/LiveCharts';
 
-const BACKEND_PORTS = [5000, 5001, 5002, 5003];
-
-const getSocketUrls = () => {
-  const protocol = window.location.protocol;
-  const host = window.location.hostname;
-  return BACKEND_PORTS.map((port) => `${protocol}//${host}:${port}`);
-};
+const BACKEND_URL = "https://pico-hydropower-backend.onrender.com";
 
 function App() {
   const [isConnected, setIsConnected] = useState(false);
@@ -48,108 +42,95 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let activeSocket = null;
-    const socketUrls = getSocketUrls();
 
-    const connectToNextPort = (index = 0) => {
+    const socket = io(BACKEND_URL, {
+      reconnection: true,
+      reconnectionDelay: 2000,
+      timeout: 10000,
+      transports: ['websocket', 'polling'],
+    });
+
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
       if (cancelled) return;
+      setIsConnected(true);
+      console.log(`Connected to monitoring backend on ${BACKEND_URL}`);
+    });
 
-      const socket = io(socketUrls[index], {
-        reconnection: false,
-        timeout: 4000,
-        transports: ['websocket', 'polling'],
+    socket.on('connect_error', (err) => {
+      if (cancelled) return;
+      setIsConnected(false);
+      console.warn('Connection error:', err.message);
+    });
+
+    socket.on('disconnect', () => {
+      setIsConnected(false);
+      console.log('Disconnected from monitoring backend');
+    });
+
+    socket.on('telemetry', (data) => {
+      setTelemetry(data);
+      
+      // Sync local slider input value with database PWM value if not actively changing
+      if (data.auto_ramp_active || !data.system_on) {
+        setSliderValue(data.pwm);
+      } else {
+        setSliderValue(data.manual_pwm);
+      }
+
+      // Add to rolling history chart data (max 60 points)
+      setHistory(prev => {
+        const next = [...prev, data];
+        if (next.length > 60) next.shift();
+        return next;
       });
 
-      activeSocket = socket;
-      socketRef.current = socket;
+      // Generation Log Trigger Logic
+      const now = Date.now();
+      const stateChanged = 
+        prevStatesRef.current.system_on !== data.system_on ||
+        prevStatesRef.current.relay_on !== data.relay_on;
+      
+      const timeElapsed = (now - lastLogTimeRef.current) >= 5000; // Log periodically every 5 seconds if system is on
 
-      socket.on('connect', () => {
-        if (cancelled) return;
-        setIsConnected(true);
-        console.log(`Connected to monitoring backend on ${socketUrls[index]}`);
-      });
-
-      socket.on('connect_error', () => {
-        if (cancelled) return;
-        socket.disconnect();
-        if (index + 1 < socketUrls.length) {
-          connectToNextPort(index + 1);
-        } else {
-          setIsConnected(false);
-          console.warn('Unable to connect to monitoring backend on any fallback port.');
-        }
-      });
-
-      socket.on('disconnect', () => {
-        setIsConnected(false);
-        console.log('Disconnected from monitoring backend');
-      });
-
-      socket.on('telemetry', (data) => {
-        setTelemetry(data);
+      if (stateChanged || (data.system_on && timeElapsed)) {
+        // Calculate power: Power (W) = V * I / 1000 (assuming Current is in mA)
+        const powerW = Number(((data.voltage * data.current) / 1000).toFixed(2));
         
-        // Sync local slider input value with database PWM value if not actively changing
-        if (data.auto_ramp_active || !data.system_on) {
-          setSliderValue(data.pwm);
-        } else {
-          setSliderValue(data.manual_pwm);
-        }
-
-        // Add to rolling history chart data (max 60 points)
-        setHistory(prev => {
-          const next = [...prev, data];
-          if (next.length > 60) next.shift();
-          return next;
-        });
-
-        // Generation Log Trigger Logic
-        const now = Date.now();
-        const stateChanged = 
-          prevStatesRef.current.system_on !== data.system_on ||
-          prevStatesRef.current.relay_on !== data.relay_on;
-        
-        const timeElapsed = (now - lastLogTimeRef.current) >= 5000; // Log periodically every 5 seconds if system is on
-
-        if (stateChanged || (data.system_on && timeElapsed)) {
-          // Calculate power: Power (W) = V * I / 1000 (assuming Current is in mA)
-          const powerW = Number(((data.voltage * data.current) / 1000).toFixed(2));
-          
-          let eventDescription = "Monitoring Feed";
-          if (stateChanged) {
-            if (prevStatesRef.current.system_on !== data.system_on) {
-              eventDescription = data.system_on ? "System Power ON" : "System Power OFF";
-            } else if (prevStatesRef.current.relay_on !== data.relay_on) {
-              eventDescription = data.relay_on ? "Load Relay CONNECTED" : "Load Relay DISCONNECTED";
-            }
-          } else {
-            eventDescription = "Steady State Generation";
+        let eventDescription = "Monitoring Feed";
+        if (stateChanged) {
+          if (prevStatesRef.current.system_on !== data.system_on) {
+            eventDescription = data.system_on ? "System Power ON" : "System Power OFF";
+          } else if (prevStatesRef.current.relay_on !== data.relay_on) {
+            eventDescription = data.relay_on ? "Load Relay CONNECTED" : "Load Relay DISCONNECTED";
           }
-
-          const newLog = {
-            id: `${data.timestamp}-${Math.random()}`,
-            timestamp: data.timestamp,
-            voltage: data.voltage,
-            current: data.current,
-            power: powerW,
-            system_on: data.system_on,
-            relay_on: data.relay_on,
-            event: eventDescription
-          };
-
-          setLogs(prev => [newLog, ...prev].slice(0, 100)); // Cap logs at 100 entries
-
-          // Update tracking references
-          prevStatesRef.current = { system_on: data.system_on, relay_on: data.relay_on };
-          lastLogTimeRef.current = now;
+        } else {
+          eventDescription = "Steady State Generation";
         }
-      });
-    };
 
-    connectToNextPort();
+        const newLog = {
+          id: `${data.timestamp}-${Math.random()}`,
+          timestamp: data.timestamp,
+          voltage: data.voltage,
+          current: data.current,
+          power: powerW,
+          system_on: data.system_on,
+          relay_on: data.relay_on,
+          event: eventDescription
+        };
+
+        setLogs(prev => [newLog, ...prev].slice(0, 100)); // Cap logs at 100 entries
+
+        // Update tracking references
+        prevStatesRef.current = { system_on: data.system_on, relay_on: data.relay_on };
+        lastLogTimeRef.current = now;
+      }
+    });
 
     return () => {
       cancelled = true;
-      activeSocket?.disconnect();
+      socket.disconnect();
     };
   }, []);
 
