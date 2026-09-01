@@ -163,10 +163,9 @@ const writeToFirebase = async (command, value) => {
     updates['/control/loadOn'] = !!value;
   } else if (command === 'system_on') {
     updates['/control/systemOn'] = !!value;
+  } else if (command === 'manual_pwm') {
+    updates['/control/manualPwm'] = parseInt(value, 10);
   }
-  // Note: manual_pwm is not currently read by the ESP32 firmware (it always
-  // soft-starts to a fixed target on its own). Sending it is harmless but
-  // has no effect on the real motor until the firmware is updated to read it.
 
   await update(ref(db, '/'), updates);
 };
