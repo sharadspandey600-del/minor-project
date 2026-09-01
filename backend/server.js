@@ -4,7 +4,7 @@ const http = require('http');
 const path = require('path');
 const { Server } = require('socket.io');
 const { initializeApp } = require('firebase/app');
-const { getDatabase, ref, onValue, set, update } = require('firebase/database');
+const { getDatabase, ref, onValue, update } = require('firebase/database');
 require('dotenv').config({ path: path.join(__dirname, '.env'), override: true });
 
 const app = express();
@@ -19,8 +19,7 @@ const io = new Server(server, {
   }
 });
 
-// Firebase configuration placeholder
-// The user can edit this file directly or set these environment variables
+// Firebase configuration
 const firebaseConfig = {
   apiKey: process.env.FIREBASE_API_KEY || "YOUR_API_KEY_HERE",
   authDomain: process.env.FIREBASE_AUTH_DOMAIN || "YOUR_AUTH_DOMAIN_HERE",
@@ -34,15 +33,14 @@ const firebaseConfig = {
 let db = null;
 let useSimulator = true;
 
-// Check if firebase config has been configured with real credentials
 const isFirebaseConfigured = () => {
-  return firebaseConfig.databaseURL && 
+  return firebaseConfig.databaseURL &&
          !firebaseConfig.databaseURL.includes("YOUR_DATABASE_URL_HERE") &&
-         firebaseConfig.apiKey && 
+         firebaseConfig.apiKey &&
          !firebaseConfig.apiKey.includes("YOUR_API_KEY_HERE");
 };
 
-// Local cache of system state (synced with Firebase or managed by simulator)
+// Local cache of system state, shared shape with frontend (unchanged from before)
 let systemState = {
   voltage: 0.0,
   current: 0.0,
@@ -57,20 +55,19 @@ let systemState = {
   timestamp: Math.floor(Date.now() / 1000)
 };
 
-// Simulation State & Loop Variables
+// ===================== SIMULATOR MODE (used only when Firebase is NOT configured) =====================
 let simulatorInterval = null;
 let rampTimer = null;
 
 const startSimulator = () => {
   if (simulatorInterval) return;
   console.log("⚡ Starting Pico Hydropower Simulator Mode...");
-  
+
   simulatorInterval = setInterval(() => {
     const now = Math.floor(Date.now() / 1000);
     systemState.timestamp = now;
 
     if (!systemState.system_on) {
-      // System is OFF: everything decay/rests at 0
       systemState.pwm = 0;
       systemState.auto_ramp_active = false;
       systemState.rpm = Math.max(0, systemState.rpm - 300);
@@ -79,38 +76,29 @@ const startSimulator = () => {
       systemState.current = Math.max(0, systemState.current - 20);
       systemState.status = "OFFLINE";
     } else {
-      // System is ON
       systemState.status = "OK";
-      
-      // Calculate physics based on current PWM
-      const targetRPM = systemState.pwm * 40; // Max 4000 RPM at 100% PWM
+      const targetRPM = systemState.pwm * 40;
       const rpmNoise = (Math.random() - 0.5) * 15;
       systemState.rpm = Math.round(systemState.rpm + (targetRPM - systemState.rpm) * 0.25 + rpmNoise);
       if (systemState.rpm < 0) systemState.rpm = 0;
 
-      // Frequency = RPM / 60
       systemState.frequency = Number((systemState.rpm / 60).toFixed(1));
 
-      // Voltage proportional to frequency (e.g. V = Freq * 4.2)
       const voltageNoise = (Math.random() - 0.5) * 2;
       systemState.voltage = Number((systemState.frequency * 4.25 + voltageNoise).toFixed(1));
       if (systemState.voltage < 0) systemState.voltage = 0;
 
-      // Current drawn only if Relay is ON (load connected)
       if (systemState.relay_on) {
-        // I = V / R (let's say load is 1000 ohms, so current is scaled, or dynamic load)
-        const loadResistance = 0.85; // Ohm scale
+        const loadResistance = 0.85;
         const currentNoise = (Math.random() - 0.5) * 10;
         systemState.current = Number(((systemState.voltage / loadResistance) + currentNoise).toFixed(1));
       } else {
-        // Open circuit: residual tiny current (idle noise)
         systemState.current = Number((Math.random() * 8 + 2).toFixed(1));
       }
     }
 
-    // Broadcast updated state to all connected socket clients
     io.emit('telemetry', systemState);
-  }, 1000); // 1-second ticks for simulator reactivity
+  }, 1000);
 };
 
 const runSimulationRamp = () => {
@@ -121,7 +109,7 @@ const runSimulationRamp = () => {
 
   let elapsed = 0;
   rampTimer = setInterval(() => {
-    elapsed += 0.5; // ticks every 500ms
+    elapsed += 0.5;
     if (elapsed >= 10) {
       clearInterval(rampTimer);
       systemState.pwm = 70;
@@ -129,146 +117,12 @@ const runSimulationRamp = () => {
       systemState.auto_ramp_active = false;
       console.log("✅ Soft-start Auto Ramp Completed. Manual override enabled.");
     } else {
-      // linear ramp from 0 to 70 over 10 seconds
       systemState.pwm = Math.round((elapsed / 10) * 70);
     }
     io.emit('telemetry', systemState);
   }, 500);
 };
 
-// Initialize Firebase if configured
-if (isFirebaseConfigured()) {
-  try {
-    const firebaseApp = initializeApp(firebaseConfig);
-    db = getDatabase(firebaseApp);
-    useSimulator = false;
-    console.log("🔥 Connected to Firebase Realtime Database!");
-
-    // Listen to database reference
-    const dbRef = ref(db, '/');
-    onValue(dbRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data) {
-        // Sync local cache with Firebase database updates
-        systemState = { ...systemState, ...data };
-        io.emit('telemetry', systemState);
-      }
-    });
-  } catch (error) {
-    console.error("❌ Firebase initialization failed. Falling back to simulator mode.", error);
-    useSimulator = true;
-  }
-} else {
-  console.log("⚠️ Firebase not configured. Running in simulator mode by default.");
-  useSimulator = true;
-}
-
-if (useSimulator) {
-  startSimulator();
-}
-
-// REST endpoints for explicit commands (useful as fallback)
-app.get('/api/status', (req, res) => {
-  res.json(systemState);
-});
-
-app.post('/api/control', async (req, res) => {
-  const { command, value } = req.body;
-  console.log(`✉️ Received Control HTTP API: ${command} = ${value}`);
-
-  try {
-    if (useSimulator) {
-      handleSimulatorCommand(command, value);
-    } else {
-      await writeToFirebase(command, value);
-    }
-    res.json({ success: true, state: systemState });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/telemetry', async (req, res) => {
-  const telemetryUpdate = req.body;
-  console.log('📥 Received telemetry payload from ESP32:', telemetryUpdate);
-
-  try {
-    if (useSimulator) {
-      const allowedKeys = [
-        'voltage', 'current', 'frequency', 'rpm', 'status',
-        'pwm', 'manual_pwm', 'system_on', 'relay_on', 'auto_ramp_active', 'timestamp'
-      ];
-      Object.keys(telemetryUpdate).forEach((key) => {
-        if (allowedKeys.includes(key)) {
-          systemState[key] = telemetryUpdate[key];
-        }
-      });
-      io.emit('telemetry', systemState);
-      return res.json({ success: true, state: systemState });
-    }
-
-    await update(ref(db, '/'), telemetryUpdate);
-    res.json({ success: true, state: telemetryUpdate });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Socket.io handlers
-io.on('connection', (socket) => {
-  console.log(`🔌 Client connected: ${socket.id}`);
-  
-  // Send current state to newly connected client immediately
-  socket.emit('telemetry', systemState);
-
-  socket.on('control', async (data) => {
-    const { command, value } = data;
-    console.log(`🔌 Received Control socket message: ${command} = ${value}`);
-    
-    if (useSimulator) {
-      handleSimulatorCommand(command, value);
-    } else {
-      try {
-        await writeToFirebase(command, value);
-      } catch (err) {
-        console.error("Firebase write error:", err);
-      }
-    }
-  });
-
-  socket.on('disconnect', () => {
-    console.log(`❌ Client disconnected: ${socket.id}`);
-  });
-});
-
-// Write to Firebase helper
-const writeToFirebase = async (command, value) => {
-  if (!db) return;
-  const updates = {};
-  
-  if (command === 'relay_on') {
-    updates['/relay_on'] = !!value;
-  } else if (command === 'system_on') {
-    const systemOn = !!value;
-    updates['/system_on'] = systemOn;
-    if (systemOn) {
-      updates['/auto_ramp_active'] = true;
-      updates['/pwm'] = 0;
-      // Note: Real ESP32 will handle the ramp, but we can write these states
-    } else {
-      updates['/auto_ramp_active'] = false;
-      updates['/pwm'] = 0;
-    }
-  } else if (command === 'manual_pwm') {
-    const pwmVal = parseInt(value, 10);
-    updates['/manual_pwm'] = pwmVal;
-    updates['/pwm'] = pwmVal; // Assume physical system updates pwm to match manual override
-  }
-  
-  await update(ref(db, '/'), updates);
-};
-
-// Handle simulator state transitions locally
 const handleSimulatorCommand = (command, value) => {
   if (command === 'relay_on') {
     systemState.relay_on = !!value;
@@ -291,10 +145,121 @@ const handleSimulatorCommand = (command, value) => {
       systemState.pwm = systemState.manual_pwm;
     }
   }
-  
-  // Broadcast updated simulator state immediately
+
   io.emit('telemetry', systemState);
 };
+
+// ===================== REAL HARDWARE MODE (Firebase configured, matches ESP32 paths) =====================
+// ESP32 firmware reads commands from  /control/systemOn  and  /control/loadOn
+// ESP32 firmware writes telemetry to  /generator/voltage, /generator/current, /generator/rpm,
+//                                      /generator/frequency, /generator/fault, /generator/timestamp
+// This backend MUST read/write those exact paths to talk to the real hardware.
+
+const writeToFirebase = async (command, value) => {
+  if (!db) return;
+  const updates = {};
+
+  if (command === 'relay_on') {
+    updates['/control/loadOn'] = !!value;
+  } else if (command === 'system_on') {
+    updates['/control/systemOn'] = !!value;
+  }
+  // Note: manual_pwm is not currently read by the ESP32 firmware (it always
+  // soft-starts to a fixed target on its own). Sending it is harmless but
+  // has no effect on the real motor until the firmware is updated to read it.
+
+  await update(ref(db, '/'), updates);
+};
+
+if (isFirebaseConfigured()) {
+  try {
+    const firebaseApp = initializeApp(firebaseConfig);
+    db = getDatabase(firebaseApp);
+    useSimulator = false;
+    console.log("🔥 Connected to Firebase Realtime Database!");
+
+    const dbRef = ref(db, '/');
+    onValue(dbRef, (snapshot) => {
+      const data = snapshot.val();
+      if (!data) return;
+
+      const control = data.control || {};
+      const generator = data.generator || {};
+
+      systemState = {
+        ...systemState,
+        system_on: !!control.systemOn,
+        relay_on: !!control.loadOn,
+        voltage: Number(generator.voltage) || 0,
+        current: Number(generator.current) || 0,
+        rpm: Number(generator.rpm) || 0,
+        frequency: Number(generator.frequency) || 0,
+        status: control.systemOn ? (generator.fault || "OK") : "OFFLINE",
+        timestamp: generator.timestamp
+          ? Math.floor(Number(generator.timestamp) / 1000)
+          : Math.floor(Date.now() / 1000)
+      };
+
+      io.emit('telemetry', systemState);
+    });
+  } catch (error) {
+    console.error("❌ Firebase initialization failed. Falling back to simulator mode.", error);
+    useSimulator = true;
+  }
+} else {
+  console.log("⚠️ Firebase not configured. Running in simulator mode by default.");
+  useSimulator = true;
+}
+
+if (useSimulator) {
+  startSimulator();
+}
+
+// ===================== REST endpoints =====================
+app.get('/api/status', (req, res) => {
+  res.json(systemState);
+});
+
+app.post('/api/control', async (req, res) => {
+  const { command, value } = req.body;
+  console.log(`✉️ Received Control HTTP API: ${command} = ${value}`);
+
+  try {
+    if (useSimulator) {
+      handleSimulatorCommand(command, value);
+    } else {
+      await writeToFirebase(command, value);
+    }
+    res.json({ success: true, state: systemState });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===================== Socket.io =====================
+io.on('connection', (socket) => {
+  console.log(`🔌 Client connected: ${socket.id}`);
+  socket.emit('telemetry', systemState);
+
+  socket.on('control', async (data) => {
+    const { command, value } = data;
+    console.log(`🔌 Received Control socket message: ${command} = ${value}`);
+
+    if (useSimulator) {
+      handleSimulatorCommand(command, value);
+    } else {
+      try {
+        await writeToFirebase(command, value);
+      } catch (err) {
+        console.error("Firebase write error:", err);
+      }
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`❌ Client disconnected: ${socket.id}`);
+  });
+});
 
 const PORT = Number(process.env.PORT || 5000);
 
