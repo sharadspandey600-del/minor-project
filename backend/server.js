@@ -155,6 +155,8 @@ const handleSimulatorCommand = (command, value) => {
 //                                      /generator/frequency, /generator/fault, /generator/timestamp
 // This backend MUST read/write those exact paths to talk to the real hardware.
 
+const DEFAULT_STARTUP_PWM = 70; // % speed the motor ramps to automatically when System is turned ON
+
 const writeToFirebase = async (command, value) => {
   if (!db) return;
   const updates = {};
@@ -163,6 +165,10 @@ const writeToFirebase = async (command, value) => {
     updates['/control/loadOn'] = !!value;
   } else if (command === 'system_on') {
     updates['/control/systemOn'] = !!value;
+    // Auto-set a default speed on power ON (mirrors the old simulator's
+    // soft-start-to-70% behavior). On power OFF, bring the commanded
+    // speed back to 0 so the motor/slider both settle at 0%.
+    updates['/control/manualPwm'] = value ? DEFAULT_STARTUP_PWM : 0;
   } else if (command === 'manual_pwm') {
     updates['/control/manualPwm'] = parseInt(value, 10);
   }
@@ -185,10 +191,24 @@ if (isFirebaseConfigured()) {
       const control = data.control || {};
       const generator = data.generator || {};
 
+      // NEW: keep the dashboard's slider in sync with the actual /control/manualPwm
+      // value in Firebase. Without this, manual_pwm/pwm stayed stuck at their
+      // initial value (0) forever, so the slider snapped back to 0 on every
+      // telemetry update (including unrelated ones like toggling the relay).
+      const manualPwmValue = control.manualPwm !== undefined
+        ? Number(control.manualPwm)
+        : systemState.manual_pwm;
+
       systemState = {
         ...systemState,
         system_on: !!control.systemOn,
         relay_on: !!control.loadOn,
+        manual_pwm: manualPwmValue,
+        pwm: manualPwmValue,
+        // Real hardware ramps continuously toward whatever manualPwm is set to
+        // (see ESP32 firmware), so there's no discrete "ramping" phase to lock
+        // the slider during, unlike the simulator. Keep it always editable.
+        auto_ramp_active: false,
         voltage: Number(generator.voltage) || 0,
         current: Number(generator.current) || 0,
         rpm: Number(generator.rpm) || 0,
